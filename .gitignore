@@ -1,0 +1,8 @@
+﻿__pycache__/
+.pytest_cache/
+.venv/
+.env
+*.pyc
+.DS_Store
+
+qualification-result.json
