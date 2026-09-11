@@ -1,12 +1,16 @@
-﻿from pathlib import Path
+from pathlib import Path
 import csv
 import io
 import json
 import os
+import ipaddress
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+import httpx
+import socket
+from urllib.parse import urlparse
 
 from .models import Workflow
 from .engine import qualify_workflow
@@ -14,6 +18,26 @@ from .engine import qualify_workflow
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
+
+
+def _validate_agent_url(agent_url: str) -> str:
+    """Allow only public HTTP(S) agent endpoints for remote qualification."""
+    parsed = urlparse(agent_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(status_code=400, detail="agent_url must be an HTTP(S) URL.")
+
+    host = parsed.hostname
+    try:
+        addresses = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise HTTPException(status_code=400, detail="Could not resolve agent_url host.")
+
+    for item in addresses:
+        ip = item[4][0]
+        addr = ipaddress.ip_address(ip)
+        if not addr.is_global:
+            raise HTTPException(status_code=400, detail="Private or local agent endpoints are not allowed.")
+    return agent_url
 
 
 app = FastAPI(
@@ -111,6 +135,85 @@ def demo():
 def qualify(workflow: Workflow):
     return qualify_workflow(workflow)
 
+
+
+@app.post("/api/qualify/remote")
+async def qualify_remote(payload: dict):
+    """Run qualification against a company's HTTP agent endpoint.
+
+    The agent must accept POST JSON: {"input": <case input>} and return
+    either a JSON value or {"output": <value>, "cost_usd": <number>}.
+    """
+    agent_url = payload.get("agent_url")
+    if not isinstance(agent_url, str):
+        raise HTTPException(status_code=400, detail="agent_url is required.")
+    agent_url = _validate_agent_url(agent_url)
+
+    name = payload.get("name") or "Remote AI Agent"
+    description = payload.get("description") or "Remote agent qualification"
+    cases = payload.get("test_cases") or []
+    if not cases:
+        raise HTTPException(status_code=400, detail="At least one test case is required.")
+
+    workflow = Workflow(
+        name=name,
+        description=description,
+        target_reliability=float(payload.get("target_reliability", 95)),
+        maximum_critical_failures=int(payload.get("maximum_critical_failures", 0)),
+        maximum_human_review_rate=float(payload.get("maximum_human_review_rate", 20)),
+        maximum_average_latency_ms=payload.get("maximum_average_latency_ms"),
+        maximum_average_cost_usd=payload.get("maximum_average_cost_usd"),
+        test_cases=[],
+    )
+
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        for index, case in enumerate(cases, 1):
+            if not isinstance(case, dict):
+                raise HTTPException(status_code=400, detail=f"Test case {index} must be an object.")
+            case_id = str(case.get("case_id") or f"CASE-{index:03d}")
+            started = time.perf_counter()
+            try:
+                response = await client.post(agent_url, json={"input": case.get("input_data")})
+                latency_ms = (time.perf_counter() - started) * 1000
+                response.raise_for_status()
+                data = response.json()
+                actual = data.get("output") if isinstance(data, dict) and "output" in data else data
+                cost = float(data.get("cost_usd", 0) or 0) if isinstance(data, dict) else 0.0
+                workflow.test_cases.append({
+                    "case_id": case_id,
+                    "input_data": case.get("input_data"),
+                    "expected_output": case.get("expected_output"),
+                    "actual_output": actual,
+                    "success": actual == case.get("expected_output"),
+                    "latency_ms": latency_ms,
+                    "maximum_latency_ms": case.get("maximum_latency_ms"),
+                    "tool_error": False,
+                    "critical": bool(case.get("critical", False)),
+                    "human_review_required": bool(case.get("human_review_required", False)),
+                    "estimated_cost_usd": max(cost, 0),
+                    "maximum_cost_usd": case.get("maximum_cost_usd"),
+                })
+            except Exception as exc:
+                latency_ms = (time.perf_counter() - started) * 1000
+                workflow.test_cases.append({
+                    "case_id": case_id,
+                    "input_data": case.get("input_data"),
+                    "expected_output": case.get("expected_output"),
+                    "actual_output": None,
+                    "success": False,
+                    "latency_ms": latency_ms,
+                    "maximum_latency_ms": case.get("maximum_latency_ms"),
+                    "tool_error": True,
+                    "critical": bool(case.get("critical", False)),
+                    "human_review_required": bool(case.get("human_review_required", False)),
+                    "estimated_cost_usd": 0,
+                    "maximum_cost_usd": case.get("maximum_cost_usd"),
+                    "error_message": str(exc),
+                    "failure_category": "TOOL_ERROR",
+                })
+
+    return qualify_workflow(workflow)
 
 @app.post("/api/qualify/json")
 async def qualify_json(file: UploadFile = File(...)):

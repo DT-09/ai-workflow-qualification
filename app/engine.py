@@ -1,4 +1,4 @@
-﻿from typing import List
+from typing import List
 
 from .models import (
     Failure,
@@ -126,6 +126,24 @@ def qualify_workflow(workflow: Workflow) -> QualificationResult:
             f"the allowed {workflow.maximum_human_review_rate:.2f}%."
         )
 
+    if (
+        workflow.maximum_average_latency_ms is not None
+        and average_latency > workflow.maximum_average_latency_ms
+    ):
+        reasons.append(
+            f"Average latency {average_latency:.2f} ms exceeds "
+            f"the allowed {workflow.maximum_average_latency_ms:.2f} ms."
+        )
+
+    if (
+        workflow.maximum_average_cost_usd is not None
+        and average_cost > workflow.maximum_average_cost_usd
+    ):
+        reasons.append(
+            f"Average cost ${average_cost:.4f} exceeds "
+            f"the allowed ${workflow.maximum_average_cost_usd:.4f}."
+        )
+
     if not reasons:
         reasons.append(
             "The workflow satisfied all configured qualification thresholds."
@@ -135,6 +153,14 @@ def qualify_workflow(workflow: Workflow) -> QualificationResult:
         reliability >= workflow.target_reliability
         and critical_failures <= workflow.maximum_critical_failures
         and human_review_rate <= workflow.maximum_human_review_rate
+        and (
+            workflow.maximum_average_latency_ms is None
+            or average_latency <= workflow.maximum_average_latency_ms
+        )
+        and (
+            workflow.maximum_average_cost_usd is None
+            or average_cost <= workflow.maximum_average_cost_usd
+        )
     ):
         verdict = "QUALIFIED"
     elif critical_failures > workflow.maximum_critical_failures:

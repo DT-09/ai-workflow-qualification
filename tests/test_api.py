@@ -129,3 +129,7 @@ def test_real_agent_execution():
     assert result.successful_cases == 2
     assert result.reliability_score == 100
     assert result.verdict == "QUALIFIED"
+def test_remote_qualification_endpoint_validation():
+    response = client.post("/api/qualify/remote", json={"name": "X", "test_cases": [{"input_data": "x", "expected_output": "y"}]})
+    assert response.status_code == 400
+    assert "agent_url" in response.json()["detail"]
